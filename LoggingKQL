@@ -1,0 +1,86 @@
+// Define lookback periods for clarity and consistency
+let dt_lookBack = 7d; // How far back to check Syslog data
+let ioc_lookBack = 14d; // How far back to check Threat Intelligence indicators
+// Step 1: Process Threat Intelligence Indicators to get a clean list of domain IoCs
+let Domain_Indicators = ThreatIntelIndicators
+| where TimeGenerated > ago(ioc_lookBack) // Use the defined lookback period for IoCs
+| where SourceSystem in ("bforeai-east2" , "Microsoft Defender Threat Intelligence") // Filter by source if needed
+| extend data_json = parse_json(Data) // Parse the JSON data field
+// It's safer to use a distinct name for the extended confidence in case a 'Confidence' column already exists
+| extend Confidence_Custom = toint(data_json.confidence)
+| where Confidence_Custom > 80 // Filter based on the confidence score from the JSON data
+| extend IndicatorPattern = tostring(data_json.pattern) // Extract the pattern string once
+// Extract the domain name using regex, assuming STIX format 'domain-name:value = '...'
+| extend DomainName_Indicator = extract(@"domain-name:value\s*=\s*'([^']+)'", 1, IndicatorPattern)
+// IMPORTANT: Filter *after* extraction to only include indicators where a domain was successfully extracted
+| where isnotempty(DomainName_Indicator)
+// Project the necessary fields for joining and final output
+| project
+    IndicatorTimeGenerated = TimeGenerated, // Rename for clarity
+    DomainName_Indicator, // The domain name from the threat feed
+    Confidence = Confidence_Custom, // Use the extracted confidence
+    IndicatorId = tostring(data_json.id),
+    Description = tostring(data_json.description)
+// Optional optimization: If an indicator ID can have multiple identical domain patterns,
+// you might use distinct here, but be careful not to lose needed context.
+// | distinct DomainName_Indicator, IndicatorId, IndicatorTimeGenerated, Confidence, Description
+;
+// Step 2: Process Syslog data to extract potential domain names
+let Syslog_Domains = Syslog
+| where TimeGenerated > ago(dt_lookBack) // Use the defined lookback period for Syslog
+// --- Optional Pre-filtering ---
+// Add filters here if you know which Syslog entries are most likely to contain domains
+// (e.g., DNS logs, proxy logs). This can significantly improve performance.
+// Example: | where ProcessName has "dns" or SyslogMessage contains "URL"
+// -----------------------------
+// Extract potential domain names from the Syslog message.
+// This regex is broad; adjust if you have specific log formats.
+// Using tolower() makes the matching case-insensitive later.
+| extend DomainName_Syslog = extract("(([a-z0-9]+(?:-[a-z0-9]+)*\\.)+[a-z]{2,})", 1, tolower(SyslogMessage))
+// Keep only logs where a potential domain pattern was found
+| where isnotempty(DomainName_Syslog)
+// --- Optional Validation ---
+// You could add TLD validation here if you have a reliable list of TLDs, but it's often complex.
+// The join itself acts as a form of validation against the threat feed.
+// --------------------------
+// Project the fields needed for joining and final output from Syslog
+| project
+    SyslogTimeGenerated = TimeGenerated, // Rename for clarity
+    DomainName_Syslog, // The domain extracted from the log message
+    Computer,
+    ProcessName,
+    HostIP,
+    Type,
+    SyslogMessage // Keep original message for context if needed
+;
+// Step 3: Join Threat Indicators with Syslog data
+Domain_Indicators
+// Join the indicator domains with the domains found in Syslog.
+// 'kind=inner' means we only keep matches found in both tables.
+// 'on $left.DomainName_Indicator =~ $right.DomainName_Syslog' performs a case-insensitive comparison
+// between the domain from the threat feed and the domain extracted from Syslog.
+| join kind=innerunique  (Syslog_Domains) on $left.DomainName_Indicator == $right.DomainName_Syslog
+// Step 4: Summarize results (optional but recommended)
+// If a single indicator domain matches multiple syslog entries, get the latest one.
+// Group by the unique identifier of the threat indicator and the matched domain.
+| summarize SyslogTimeGenerated = arg_max(SyslogTimeGenerated, *) by IndicatorId, DomainName_Indicator
+// Step 5: Project the final desired output columns
+| project
+    // Timestamp of the matching Syslog event
+    timestamp = SyslogTimeGenerated,
+    // Details from the Threat Indicator
+    IndicatorId,
+    ThreatIntel_Domain = DomainName_Indicator, // Renamed for clarity
+    Confidence,
+    Description,
+    // Details from the matching Syslog entry
+    Matched_Syslog_Domain = DomainName_Syslog, // Renamed for clarity
+    Computer,
+    HostName = tostring(split(Computer, '.', 0)[0]), // Extract Hostname from FQDN
+    DnsDomain = iff(Computer contains ".", substring(Computer, indexof(Computer, '.') + 1), ""), // Safer extraction of DNS domain
+    ProcessName,
+    HostIP,
+    Type,
+    SyslogMessage // Optional: Include the original Syslog message
+// Optional: Sort results
+| order by timestamp desc
