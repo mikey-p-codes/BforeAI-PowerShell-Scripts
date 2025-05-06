@@ -1,3 +1,4 @@
+![logs.png](/screens/logs.png)
 # BforeAI PowerShell Scripts
 
 This repository contains two PowerShell scripts designed to process domain lists, send web requests, and log the results to a Syslog server. These scripts were created to capture log data from the BforeAI Intelligence feed and correlate them to an existing Azure Sentinel Instance.
